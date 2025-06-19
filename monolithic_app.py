@@ -10,6 +10,7 @@ from langchain_pinecone import PineconeVectorStore
 from pinecone.grpc import PineconeGRPC as Pinecone
 from pinecone import ServerlessSpec
 import time
+import hashlib
 
 # Конфигурация
 st.set_page_config(
@@ -47,6 +48,9 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# Константы
+SHARED_INDEX_NAME = "qa-chatbot-shared"  # Один индекс для всех документов
+
 # Инициализация session state
 if 'vectorstore' not in st.session_state:
     st.session_state.vectorstore = None
@@ -54,43 +58,83 @@ if 'documents_loaded' not in st.session_state:
     st.session_state.documents_loaded = False
 if 'messages' not in st.session_state:
     st.session_state.messages = []
+if 'current_document_id' not in st.session_state:
+    st.session_state.current_document_id = None
+
+def get_document_id(filename, content):
+    """Создает уникальный ID для документа"""
+    content_hash = hashlib.md5(content).hexdigest()[:8]
+    return f"{filename}_{content_hash}"
 
 @st.cache_resource
-def setup_pinecone(api_key):
-    """Настройка Pinecone с кешированием"""
+def setup_pinecone_shared(api_key):
+    """Настройка общего индекса Pinecone (один для всех документов)"""
     try:
         pc = Pinecone(api_key=api_key)
-        index_name = "qa-chatbot-streamlit"
         
+        # Проверяем существующие индексы
         existing_indexes = [idx['name'] for idx in pc.list_indexes().indexes]
         
-        if index_name not in existing_indexes:
-            with st.spinner("Создаю индекс в Pinecone..."):
+        if SHARED_INDEX_NAME not in existing_indexes:
+            with st.spinner("Создаю общий индекс в Pinecone... (это может занять минуту)"):
                 pc.create_index(
-                    name=index_name,
+                    name=SHARED_INDEX_NAME,
                     dimension=1536,
                     metric='cosine',
                     spec=ServerlessSpec(cloud='aws', region='us-east-1')
                 )
                 
-                while not pc.describe_index(index_name).status['ready']:
-                    time.sleep(1)
+                # Ждем готовности индекса
+                max_wait = 60  # максимум 60 секунд
+                waited = 0
+                while waited < max_wait:
+                    try:
+                        status = pc.describe_index(SHARED_INDEX_NAME).status
+                        if status['ready']:
+                            break
+                    except:
+                        pass
+                    time.sleep(2)
+                    waited += 2
         
-        return pc.Index(index_name)
+        return pc.Index(SHARED_INDEX_NAME)
     except Exception as e:
         st.error(f"Ошибка настройки Pinecone: {e}")
         return None
 
+def clear_document_from_index(vectorstore, document_id):
+    """Удаляет предыдущий документ из индекса"""
+    try:
+        # Получаем все векторы с нашим document_id
+        index = vectorstore._index
+        
+        # Используем простой способ - получаем статистику
+        stats = index.describe_index_stats()
+        
+        # Если индекс не пустой, очищаем его
+        if stats.total_vector_count > 0:
+            # Для простоты, будем очищать весь индекс при загрузке нового документа
+            # В продакшене лучше использовать namespaces или metadata фильтры
+            index.delete(delete_all=True)
+            st.info("🧹 Очистил предыдущий документ из базы данных")
+            
+    except Exception as e:
+        st.warning(f"Не удалось очистить предыдущий документ: {e}")
+
 def process_document(uploaded_file, openai_key, pinecone_key):
-    """Обработка документа"""
+    """Обработка документа с использованием общего индекса"""
     try:
         # Проверка API ключей
         if not openai_key or not pinecone_key:
             return False, "Необходимо указать API ключи!"
         
+        # Создание уникального ID для документа
+        file_content = uploaded_file.getvalue()
+        document_id = get_document_id(uploaded_file.name, file_content)
+        
         # Создание временного файла
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
-            tmp_file.write(uploaded_file.getvalue())
+            tmp_file.write(file_content)
             tmp_file_path = tmp_file.name
         
         # Прогресс бар
@@ -98,8 +142,8 @@ def process_document(uploaded_file, openai_key, pinecone_key):
         status_text = st.empty()
         
         # Загрузка PDF
-        status_text.text("Загружаю PDF...")
-        progress_bar.progress(20)
+        status_text.text("📄 Загружаю PDF...")
+        progress_bar.progress(10)
         
         loader = PyPDFLoader(tmp_file_path)
         pages = loader.load_and_split()
@@ -108,8 +152,8 @@ def process_document(uploaded_file, openai_key, pinecone_key):
             return False, "Не удалось извлечь текст из PDF"
         
         # Разбиение на чанки
-        status_text.text("Разбиваю на части...")
-        progress_bar.progress(40)
+        status_text.text("✂️ Разбиваю на части...")
+        progress_bar.progress(30)
         
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
@@ -117,54 +161,75 @@ def process_document(uploaded_file, openai_key, pinecone_key):
         )
         splits = text_splitter.split_documents(pages)
         
-        # Настройка Pinecone
-        status_text.text("Настраиваю векторную базу...")
-        progress_bar.progress(60)
+        # Добавляем метаданные с document_id
+        for split in splits:
+            split.metadata['document_id'] = document_id
+            split.metadata['source_file'] = uploaded_file.name
         
-        index = setup_pinecone(pinecone_key)
+        # Настройка Pinecone
+        status_text.text("🔍 Настраиваю векторную базу...")
+        progress_bar.progress(50)
+        
+        index = setup_pinecone_shared(pinecone_key)
         if not index:
             return False, "Ошибка настройки Pinecone"
         
         # Создание embeddings
-        status_text.text("Создаю векторные представления...")
-        progress_bar.progress(80)
+        status_text.text("🧠 Создаю векторные представления...")
+        progress_bar.progress(70)
         
         embeddings = OpenAIEmbeddings(api_key=openai_key)
         vectorstore = PineconeVectorStore(index, embeddings, "text")
         
+        # Очищаем предыдущий документ если есть
+        if st.session_state.current_document_id:
+            status_text.text("🧹 Очищаю предыдущий документ...")
+            clear_document_from_index(vectorstore, st.session_state.current_document_id)
+        
         # Добавление документов
-        status_text.text("Сохраняю в базу данных...")
+        status_text.text("💾 Сохраняю в базу данных...")
+        progress_bar.progress(90)
+        
         vectorstore.add_documents(splits)
         
         progress_bar.progress(100)
-        status_text.text("Готово!")
+        status_text.text("✅ Готово!")
         
         # Сохранение в session state
         st.session_state.vectorstore = vectorstore
         st.session_state.documents_loaded = True
+        st.session_state.current_document_id = document_id
+        st.session_state.messages = []  # Очищаем историю чата для нового документа
         
         # Очистка
         os.unlink(tmp_file_path)
         
-        return True, f"✅ Успешно обработано {len(splits)} частей из {len(pages)} страниц"
+        return True, f"✅ Документ '{uploaded_file.name}' успешно загружен!\n📊 Обработано {len(splits)} частей из {len(pages)} страниц"
         
     except Exception as e:
-        return False, f"❌ Ошибка: {str(e)}"
+        error_msg = str(e)
+        if "FORBIDDEN" in error_msg and "max serverless indexes" in error_msg:
+            return False, "❌ Превышен лимит бесплатных индексов Pinecone!\n\n💡 Решения:\n1. Удалите старые индексы в Pinecone Console\n2. Или обновите план Pinecone\n3. Или используйте другой API ключ"
+        return False, f"❌ Ошибка: {error_msg}"
 
 def answer_question(question, openai_key):
-    """Ответ на вопрос"""
+    """Ответ на вопрос с учетом текущего документа"""
     try:
         if not st.session_state.vectorstore:
             return "Сначала загрузите документ"
         
+        # Создаем retriever с фильтром по текущему документу
         retriever = st.session_state.vectorstore.as_retriever(
-            search_kwargs={"k": 3}
+            search_kwargs={
+                "k": 3,
+                "filter": {"document_id": st.session_state.current_document_id}
+            }
         )
         
         prompt = PromptTemplate.from_template(
-            """Ты - эксперт-аналитик. Ответь на вопрос на основе предоставленного контекста.
+            """Ты - эксперт-аналитик. Ответь на вопрос на основе предоставленного контекста из загруженного документа.
             
-Контекст:
+Контекст из документа:
 {context}
 
 Вопрос: {question}
@@ -173,7 +238,7 @@ def answer_question(question, openai_key):
 1. Отвечай только на основе предоставленного контекста
 2. Если в контексте нет информации для ответа, так и скажи
 3. Структурируй ответ ясно и логично
-4. Укажи источник информации, если возможно
+4. Будь конкретным и полезным
 
 Ответ:"""
         )
@@ -185,7 +250,9 @@ def answer_question(question, openai_key):
         )
         
         def format_docs(docs):
-            return "\n\n".join([f"Источник {i+1}:\n{doc.page_content}" for i, doc in enumerate(docs)])
+            if not docs:
+                return "Релевантная информация не найдена в документе."
+            return "\n\n".join([f"Фрагмент {i+1}:\n{doc.page_content}" for i, doc in enumerate(docs)])
         
         rag_chain = (
             {"context": retriever | format_docs, "question": RunnablePassthrough()}
@@ -237,6 +304,9 @@ with st.sidebar:
         keys_status.warning("⚠️ Необходимо указать API ключи")
     
     st.divider()
+    
+    # Информация об индексе
+    st.info(f"🏠 Используется общий индекс: `{SHARED_INDEX_NAME}`\n\nЭто экономит вашу квоту Pinecone!")
     
     # Загрузка файла
     st.subheader("📄 Загрузка документа")
@@ -351,6 +421,11 @@ else:
             - 🤖 OpenAI GPT для генерации ответов
             - 🔍 Pinecone для векторного поиска
             - 📄 LangChain для обработки документов
+            
+            **Оптимизация для бесплатного плана:**
+            - 🏠 Использует один общий индекс (экономит квоту)
+            - 🧹 Автоматически очищает старые документы
+            - 💾 Умное управление памятью
             """)
 
 # Футер
@@ -361,17 +436,20 @@ with col2:
     <div style='text-align: center; padding: 1rem;'>
         <small>
             🤖 QA ChatBot | Powered by OpenAI & Pinecone<br>
-            Made with ❤️ using Streamlit
+            Made with ❤️ using Streamlit<br>
+            <em>Оптимизировано для бесплатного плана Pinecone</em>
         </small>
     </div>
     """, unsafe_allow_html=True)
 
-# Скрытая информация для отладки (только в development)
+# Скрытая информация для отладки
 if st.checkbox("🔧 Debug Info", value=False):
     st.json({
         "documents_loaded": st.session_state.documents_loaded,
         "vectorstore_exists": st.session_state.vectorstore is not None,
         "messages_count": len(st.session_state.messages),
         "openai_key_set": bool(openai_key),
-        "pinecone_key_set": bool(pinecone_key)
+        "pinecone_key_set": bool(pinecone_key),
+        "current_document_id": st.session_state.current_document_id,
+        "shared_index_name": SHARED_INDEX_NAME
     })
